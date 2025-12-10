@@ -1,15 +1,19 @@
 // Şehir arama, nokta ekleme, 1–10 kısa slider, zorunlu yorum,
 // daire rengi 1-10 -> yeşil > sarı > turuncu > kırmızı,
 // balona tıklayınca yorumları gösterme,
-// MapController post-frame ile (kırmızı hata çözümü).
+// Mapbox 3B dünya haritası ile etkileşimli görünüm.
 
 import 'dart:math';
+import 'dart:ui' show Offset;
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart' as ll;
+import 'package:mapbox_gl/mapbox_gl.dart' as mbx;
+import 'package:noise_meter/noise_meter.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 class NoisePoint {
-  final LatLng pos;
+  final mbx.LatLng pos;
   final int level; // 1–10
   final String note;
   final DateTime at;
@@ -19,7 +23,7 @@ class NoisePoint {
 
 class Place {
   final String label;
-  final LatLng center;
+  final mbx.LatLng center;
   const Place(this.label, this.center);
 }
 
@@ -32,83 +36,254 @@ class NoiseMapPage extends StatefulWidget {
 }
 
 class _NoiseMapPageState extends State<NoiseMapPage> {
-  final MapController _map = MapController();
+  final String _mapboxStyle = 'mapbox://styles/mapbox/light-v11';
+  final ll.Distance _distance = const ll.Distance();
+
+  mbx.MapboxMapController? _mapController;
+  bool _styleReady = false;
+  final List<mbx.Symbol> _symbols = [];
+  final Map<String, NoisePoint> _symbolToPoint = {};
 
   // Basit şehir dizini (örnek). İleride arama kutusuyla OS geocoding’e geçeriz.
   final List<Place> _places = const [
-    Place('Taşucu', LatLng(36.322, 33.894)),
-    Place('Silifke', LatLng(36.377, 33.933)),
-    Place('Mersin', LatLng(36.812, 34.641)),
-    Place('Adana', LatLng(37.000, 35.321)),
-    Place('Ankara', LatLng(39.925, 32.836)),
-    Place('İstanbul', LatLng(41.015, 28.979)),
-    Place('İzmir', LatLng(38.423, 27.142)),
+    Place('Taşucu', mbx.LatLng(36.322, 33.894)),
+    Place('Silifke', mbx.LatLng(36.377, 33.933)),
+    Place('Mersin', mbx.LatLng(36.812, 34.641)),
+    Place('Adana', mbx.LatLng(37.000, 35.321)),
+    Place('Ankara', mbx.LatLng(39.925, 32.836)),
+    Place('İstanbul', mbx.LatLng(41.015, 28.979)),
+    Place('İzmir', mbx.LatLng(38.423, 27.142)),
   ];
 
   final TextEditingController _search = TextEditingController();
 
-  LatLng _center = const LatLng(36.322, 33.894);
+  mbx.LatLng _center = const mbx.LatLng(36.322, 33.894);
   double _zoom = 12;
+
+  bool _isMeasuring = false;
 
   // Kaydedilmiş noktalar (şimdilik RAM’de)
   final List<NoisePoint> _points = [];
 
   // --------- RENK HARİTASI 1..10 ----------
   Color _colorFor(int lvl) {
-    // 1-3: yeşil, 4-5: sarı, 6-7: turuncu, 8-10: kırmızı (koyu)
+    // 1-3: yeşil, 4-6: sarı, 7-8: turuncu, 9-10: kırmızı (koyu)
     if (lvl <= 3) return const Color(0xFF1B5E20).withOpacity(0.55);
-    if (lvl <= 5) return const Color(0xFFF9A825).withOpacity(0.55);
-    if (lvl <= 7) return const Color(0xFFE65100).withOpacity(0.55);
+    if (lvl <= 6) return const Color(0xFFF9A825).withOpacity(0.55);
+    if (lvl <= 8) return const Color(0xFFE65100).withOpacity(0.55);
     return const Color(0xFFB71C1C).withOpacity(0.58);
   }
 
-  // ---------- HATA ÇÖZÜMÜ: move’u post-frame’te çağır ----------
-  void _jumpTo(LatLng c, {double? zoom}) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _center = c;
-      if (zoom != null) _zoom = zoom;
-      if (!mounted) return;
-      _map.move(_center, _zoom);
+  void _jumpTo(mbx.LatLng c, {double? zoom}) {
+    _center = c;
+    if (zoom != null) _zoom = zoom;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted || _mapController == null || !_styleReady) return;
+      await _mapController!.animateCamera(
+        mbx.CameraUpdate.newCameraPosition(
+          mbx.CameraPosition(
+            target: _center,
+            zoom: _zoom,
+            pitch: 45,
+            bearing: 0,
+          ),
+        ),
+      );
       setState(() {});
     });
+  }
+
+  ll.LatLng _asLL(mbx.LatLng p) => ll.LatLng(p.latitude, p.longitude);
+
+  String _colorString(Color c) {
+    final hex = c.value.toRadixString(16).padLeft(8, '0');
+    return '#${hex.substring(2)}';
+  }
+
+  Future<void> _refreshSymbols() async {
+    if (!_styleReady || _mapController == null) return;
+
+    for (final sym in _symbols) {
+      await _mapController!.removeSymbol(sym);
+    }
+    _symbols.clear();
+    _symbolToPoint.clear();
+
+    for (final p in _points) {
+      final col = _colorFor(p.level);
+      final avg = _avgAround(p.pos);
+      final sym = await _mapController!.addSymbol(
+        mbx.SymbolOptions(
+          geometry: p.pos,
+          iconImage: 'marker-15',
+          iconSize: 1.4,
+          iconColor: _colorString(col),
+          textField: avg == 0 ? '${p.level}' : avg.toStringAsFixed(1),
+          textColor: '#ffffff',
+          textHaloColor: '#000000',
+          textHaloWidth: 1.4,
+          textOffset: const Offset(0, 1.2),
+          textSize: 12,
+        ),
+      );
+      _symbols.add(sym);
+      _symbolToPoint[sym.id] = p;
+    }
+  }
+
+  void _handleSymbolTap(mbx.Symbol sym) {
+    final p = _symbolToPoint[sym.id];
+    if (p != null) _openCommentsFor(p);
   }
 
   @override
   void initState() {
     super.initState();
-    _jumpTo(_center, zoom: 12);
+    _centerOnUser();
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    _mapController?.onSymbolTapped.remove(_handleSymbolTap);
+    super.dispose();
+  }
+
+  Future<void> _centerOnUser() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return;
+
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      return;
+    }
+
+    final pos = await Geolocator.getCurrentPosition();
+    if (!mounted) return;
+    _jumpTo(mbx.LatLng(pos.latitude, pos.longitude), zoom: 16);
+  }
+
+  Future<void> _startMeasurement() async {
+    if (_isMeasuring) return;
+
+    final micStatus = await Permission.microphone.request();
+    if (!micStatus.isGranted) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Mikrofon izni olmadan ölçüm yapılamıyor.')),
+      );
+      return;
+    }
+
+    setState(() => _isMeasuring = true);
+    try {
+      final meter = NoiseMeter();
+      final reading = await meter.noiseStream.first;
+      if (!mounted) return;
+      setState(() => _isMeasuring = false);
+      await _showMeasurementDialog(reading.meanDecibel);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isMeasuring = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ölçüm başlatılamadı: $e')),
+      );
+    }
+  }
+
+  Future<void> _showMeasurementDialog(double db) async {
+    final add = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Ölçüm tamamlandı'),
+        content: Text(
+          'Mevcut gürültü seviyesi: ${db.toStringAsFixed(1)} dB.\nHaritaya eklemek ister misin?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Kapat'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Haritaya ekle'),
+          )
+        ],
+      ),
+    );
+
+    if (add == true) {
+      await _addMeasurementPoint(db);
+    }
+  }
+
+  Future<void> _addMeasurementPoint(double db) async {
+    final where = await _resolveCurrentPosition();
+    final level = _levelFromDb(db);
+    await _openAddSheet(
+      where,
+      initialLevel: level,
+      initialNote: 'Otomatik ölçüm: ${db.toStringAsFixed(1)} dB',
+    );
+  }
+
+  Future<mbx.LatLng> _resolveCurrentPosition() async {
+    try {
+      final pos = await Geolocator.getCurrentPosition();
+      return mbx.LatLng(pos.latitude, pos.longitude);
+    } catch (_) {
+      return _center;
+    }
+  }
+
+  int _levelFromDb(double db) {
+    final clamped = db.clamp(40.0, 110.0);
+    final normalized = (clamped - 40) / 70; // 0..1
+    return max(1, min(10, (1 + normalized * 9).round()));
   }
 
   // En yakın X km içindeki yorumları ver (panel için)
-  List<NoisePoint> _nearby({LatLng? ref, double km = 3}) {
+  List<NoisePoint> _nearby({mbx.LatLng? ref, double km = 3}) {
     ref ??= _center;
-    const d = Distance();
     return _points
-        .where((p) => d.as(LengthUnit.Kilometer, ref!, p.pos) <= km)
+        .where((p) =>
+            _distance.as(ll.LengthUnit.Kilometer, _asLL(ref!), _asLL(p.pos)) <=
+            km)
         .toList()
       ..sort((a, b) => b.at.compareTo(a.at));
   }
 
   // Dairenin ortalamasını hesapla (tooltip)
-  double _avgAround(LatLng at, {double km = 0.5}) {
-    const d = Distance();
-    final list =
-        _points.where((p) => d.as(LengthUnit.Kilometer, at, p.pos) <= km);
+  double _avgAround(mbx.LatLng at, {double km = 0.5}) {
+    final list = _points.where((p) =>
+        _distance.as(ll.LengthUnit.Kilometer, _asLL(at), _asLL(p.pos)) <= km);
     if (list.isEmpty) return 0;
     final sum = list.map((e) => e.level).reduce((a, b) => a + b);
     return sum / list.length;
   }
 
-  Future<void> _openAddSheet(LatLng where) async {
+  Future<void> _openAddSheet(mbx.LatLng where,
+      {int? initialLevel, String? initialNote}) async {
     final res = await showModalBottomSheet<_AddResult>(
       context: context,
       isScrollControlled: true,
-      builder: (_) => _AddPointSheet(pos: where),
+      builder: (_) => _AddPointSheet(
+        pos: where,
+        initialLevel: initialLevel,
+        initialNote: initialNote,
+      ),
     );
     if (res == null) return;
     setState(() {
       _points.add(NoisePoint(pos: where, level: res.level, note: res.note));
     });
+    await _refreshSymbols();
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Kaydedildi')),
     );
@@ -183,12 +358,7 @@ class _NoiseMapPageState extends State<NoiseMapPage> {
             ]),
             const SizedBox(height: 12),
             FilledButton.icon(
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                  content: Text(
-                      'Not: Android/iOS’ta mikrofonu açarak bulunduğun yerdeki dB ölçümünü otomatik alabileceğiz. Web/Windows’ta işaretle.'),
-                ));
-              },
+              onPressed: () => _openAddSheet(_center),
               icon: const Icon(Icons.add_location_alt),
               label: const Text('Nokta Ekle'),
             ),
@@ -262,70 +432,65 @@ class _NoiseMapPageState extends State<NoiseMapPage> {
           Expanded(
             child: Listener(
               behavior: HitTestBehavior.translucent,
-              onPointerDown: (_) {}, // web için scroll/gesture stabil
-              child: FlutterMap(
-                mapController: _map,
-                options: MapOptions(
-                  initialCenter: _center,
-                  initialZoom: _zoom,
-                  onTap: (tapPos, latLng) => _openAddSheet(latLng),
+              onPointerDown: (_) {},
+              child: mbx.MapboxMap(
+                styleString: _mapboxStyle,
+                tiltGesturesEnabled: true,
+                rotateGesturesEnabled: true,
+                scrollGesturesEnabled: true,
+                zoomGesturesEnabled: true,
+                minMaxZoomPreference: const mbx.MinMaxZoomPreference(1, 20),
+                compassEnabled: true,
+                initialCameraPosition: mbx.CameraPosition(
+                  target: _center,
+                  zoom: _zoom,
+                  pitch: 45,
                 ),
-                children: [
-                  TileLayer(
-                    urlTemplate:
-                        'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                    subdomains: const ['a', 'b', 'c'],
-                    userAgentPackageName: 'com.shhworld.app',
-                  ),
-                  // MarkerLayer (tıklanabilir daire)
-                  MarkerLayer(
-                    markers: _points.map((p) {
-                      final col = _colorFor(p.level);
-                      final avg = _avgAround(p.pos);
-                      final size = max(60.0, 40 + p.level * 14.0);
-                      return Marker(
-                        point: p.pos,
-                        width: size,
-                        height: size,
-                        alignment: Alignment.center,
-                        child: GestureDetector(
-                          onTap: () => _openCommentsFor(p),
-                          child: Container(
-                            decoration: BoxDecoration(
-                              color: col,
-                              shape: BoxShape.circle,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: col.withOpacity(0.25),
-                                  blurRadius: 16,
-                                )
-                              ],
-                            ),
-                            alignment: Alignment.center,
-                            child: Text(
-                              avg == 0 ? '${p.level}' : avg.toStringAsFixed(1),
-                              style: const TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w700),
-                            ),
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ],
+                onMapClick: (_, coord) => _openAddSheet(coord),
+                onMapCreated: (ctrl) {
+                  _mapController = ctrl;
+                  ctrl.onSymbolTapped.add(_handleSymbolTap);
+                },
+                onStyleLoadedCallback: () {
+                  _styleReady = true;
+                  _jumpTo(_center, zoom: _zoom);
+                  _refreshSymbols();
+                },
+                onCameraIdle: () async {
+                  final pos = await _mapController?.getCameraPosition();
+                  if (pos != null && mounted) {
+                    setState(() {
+                      _center = pos.target;
+                      _zoom = pos.zoom;
+                    });
+                  }
+                },
               ),
             ),
           ),
         ],
       ),
-      floatingActionButton: !isWide
-          ? FloatingActionButton.extended(
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          FloatingActionButton.extended(
+            heroTag: 'measure',
+            onPressed: _isMeasuring ? null : _startMeasurement,
+            label: Text(_isMeasuring ? 'Ölçülüyor…' : 'Ses ölç'),
+            icon: const Icon(Icons.mic),
+          ),
+          if (!isWide) ...[
+            const SizedBox(height: 12),
+            FloatingActionButton.extended(
+              heroTag: 'add-point',
               onPressed: () => _openAddSheet(_center),
               label: const Text('Nokta Ekle'),
               icon: const Icon(Icons.add_location_alt),
-            )
-          : null,
+            ),
+          ],
+        ],
+      ),
     );
   }
 }
@@ -339,17 +504,28 @@ class _AddResult {
 }
 
 class _AddPointSheet extends StatefulWidget {
-  final LatLng pos;
-  const _AddPointSheet({required this.pos});
+  final mbx.LatLng pos;
+  final int? initialLevel;
+  final String? initialNote;
+  const _AddPointSheet({required this.pos, this.initialLevel, this.initialNote});
 
   @override
   State<_AddPointSheet> createState() => _AddPointSheetState();
 }
 
 class _AddPointSheetState extends State<_AddPointSheet> {
-  int _level = 5;
-  final _note = TextEditingController();
+  late int _level;
+  late final TextEditingController _note;
   final _form = GlobalKey<FormState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _level = widget.initialLevel != null
+        ? max(1, min(10, widget.initialLevel!))
+        : 5;
+    _note = TextEditingController(text: widget.initialNote);
+  }
 
   @override
   void dispose() {
@@ -445,8 +621,8 @@ class _AddPointSheetState extends State<_AddPointSheet> {
 
   Color _previewColor(int lvl) {
     if (lvl <= 3) return const Color(0xFF1B5E20);
-    if (lvl <= 5) return const Color(0xFFF9A825);
-    if (lvl <= 7) return const Color(0xFFE65100);
+    if (lvl <= 6) return const Color(0xFFF9A825);
+    if (lvl <= 8) return const Color(0xFFE65100);
     return const Color(0xFFB71C1C);
   }
 }

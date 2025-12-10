@@ -8,7 +8,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_map: ^8.2.2
   latlong2: ^0.9.1
   geolocator: ^10.1.0
   shared_preferences: ^2.2.3
@@ -16,6 +15,7 @@ dependencies:
   noise_meter: ^3.0.1
   permission_handler: ^10.4.5
   intl: ^0.19.0
+  mapbox_gl: ^0.16.0
 
 flutter:
   uses-material-design: true
